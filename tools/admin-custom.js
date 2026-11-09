@@ -89,18 +89,50 @@
 
   // ---- Personalisation variables (subscriber name etc.) ----
   var VARS = [
-    ['שם פרטי', '{{ .Subscriber.FirstName }}'],
-    ['שם משפחה', '{{ .Subscriber.LastName }}'],
-    ['שם מלא', '{{ .Subscriber.Name }}'],
-    ['אימייל', '{{ .Subscriber.Email }}']
+    ['שם פרטי', '.Subscriber.FirstName'],
+    ['שם משפחה', '.Subscriber.LastName'],
+    ['שם מלא', '.Subscriber.Name'],
+    ['אימייל', '.Subscriber.Email']
   ];
-  var VAR_RE = /\{\{\s*\.Subscriber\.(FirstName|LastName|Name|Email)\s*\}\}/g;
+  // Text used when the subscriber has no value (e.g. no name). Remembered between sessions.
+  var varDefault = '';
+  try { varDefault = localStorage.getItem('tfVarDefault') || ''; } catch (e) { /* ignore */ }
+  function setVarDefault(v) {
+    varDefault = String(v || '').replace(/["{}|\\]/g, '').trim();
+    try { localStorage.setItem('tfVarDefault', varDefault); } catch (e) { /* ignore */ }
+  }
+  function varToken(path) {
+    return varDefault ? '{{ ' + path + ' | default "' + varDefault + '" }}' : '{{ ' + path + ' }}';
+  }
+  var VAR_RE = /\{\{\s*\.Subscriber\.(FirstName|LastName|Name|Email)\s*(?:\|\s*default\s+(?:"|&quot;)([^"&]*)(?:"|&quot;)\s*)?\}\}/g;
   var VAR_LABEL = { FirstName: 'שם פרטי', LastName: 'שם משפחה', Name: 'שם מלא', Email: 'אימייל' };
-  var CHIP_RE = /«(שם פרטי|שם משפחה|שם מלא|אימייל)»/g;
+  var CHIP_RE = /«(?:שם פרטי|שם משפחה|שם מלא|אימייל)(?: \/ [^»]*)?»/g;
+
+  // UTM tagging: the campaign name is filled in automatically when the campaign is saved.
+  var UTM_MARK = 'UTM_CAMPAIGN';
+  var UTM_QS = 'utm_source=newsletter&utm_medium=email&utm_campaign=' + UTM_MARK;
+  function addUtm(url) {
+    url = String(url || '').trim();
+    var track = /@TrackLink$/.test(url);
+    if (track) url = url.replace(/@TrackLink$/, '');
+    var hash = '', hi = url.indexOf('#');
+    if (hi > -1) { hash = url.slice(hi); url = url.slice(0, hi); }
+    url = url.replace(/([?&])utm_[a-z]+=[^&]*/g, '$1').replace(/[?&]+$/, '').replace(/\?&+/, '?').replace(/&&+/g, '&');
+    url += (url.indexOf('?') > -1 ? '&' : '?') + UTM_QS;
+    return url + hash + (track ? '@TrackLink' : '');
+  }
+  function utmName(name) {
+    return encodeURIComponent(String(name || 'newsletter').trim().replace(/\s+/g, '-'));
+  }
+  function fillUtm(body, name) {
+    return typeof body === 'string' ? body.split(UTM_MARK).join(utmName(name)) : body;
+  }
   var VAR_CSS = '.tf-vars{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:4px 0 8px;direction:rtl;font-family:Heebo,Arial,sans-serif}' +
     '.tf-vars span{font-size:12px;color:#666}' +
     '.tf-vars button{border:1px solid #C9A043;background:#FBF4E2;color:#13404B;border-radius:999px;padding:2px 10px;font-size:12px;cursor:pointer;font-family:inherit}' +
-    '.tf-vars button:hover{background:#F3E3B5}';
+    '.tf-vars button:hover{background:#F3E3B5}' +
+    '.tf-def{display:flex;align-items:center;gap:6px;flex-basis:100%;margin-top:2px}' +
+    '.tf-def input{flex:1;min-width:0;border:1px solid #ddd;border-radius:6px;padding:3px 8px;font-size:12px;font-family:inherit;direction:rtl}';
 
   // Insert text at the caret of a React/Vue controlled input so the framework sees the change.
   function insertAtCaret(el, text) {
@@ -122,15 +154,44 @@
       var b = doc.createElement('button');
       b.type = 'button'; b.textContent = '+ ' + v[0]; b.title = 'יוחלף בפרטי הנמען בזמן השליחה';
       b.addEventListener('mousedown', function (e) { e.preventDefault(); });
-      b.addEventListener('click', function (e) { e.preventDefault(); insertAtCaret(bar.__field || field, v[1]); });
+      b.addEventListener('click', function (e) { e.preventDefault(); insertAtCaret(bar.__field || field, varToken(v[1])); });
       bar.appendChild(b);
     });
+    var dl = doc.createElement('label');
+    dl.className = 'tf-def';
+    dl.innerHTML = '<span>אם חסר, להציג:</span>';
+    var di = doc.createElement('input');
+    di.type = 'text'; di.value = varDefault; di.placeholder = 'למשל: ידיד יקר (ריק = כלום)';
+    di.title = 'הטקסט שיופיע לנמען שאין לו ערך בשדה. חל על המשתנים שתוסיף מעכשיו.';
+    di.addEventListener('input', function () { setVarDefault(di.value); });
+    dl.appendChild(di);
+    bar.appendChild(dl);
+    bar.__field = field;
+    return bar;
+  }
+
+  function utmBar(doc, field) {
+    var bar = doc.createElement('div');
+    bar.className = 'tf-vars tf-utm';
+    var b = doc.createElement('button');
+    b.type = 'button'; b.textContent = '+ תיוג UTM עם שם הקמפיין';
+    b.title = 'מוסיף לקישור utm_source, utm_medium ו-utm_campaign. שם הקמפיין נכנס אוטומטית בשמירת הקמפיין.';
+    b.addEventListener('mousedown', function (e) { e.preventDefault(); });
+    b.addEventListener('click', function (e) {
+      e.preventDefault();
+      var f = bar.__field || field, w = f.ownerDocument.defaultView;
+      var proto = f.tagName === 'TEXTAREA' ? w.HTMLTextAreaElement.prototype : w.HTMLInputElement.prototype;
+      Object.getOwnPropertyDescriptor(proto, 'value').set.call(f, addUtm(f.value));
+      f.dispatchEvent(new w.Event('input', { bubbles: true }));
+    });
+    bar.appendChild(b);
     bar.__field = field;
     return bar;
   }
 
   // Visual editor sidebar: chips above the Content / Text fields of Text, Heading and Button blocks.
   var VAR_FIELDS = { 'Content': 1, 'תוכן': 1, 'Text': 1, 'טקסט': 1 };
+  var URL_FIELDS = { 'Url': 1, 'קישור': 1, 'Click through URL': 1, 'קישור בלחיצה': 1 };
   function addVarBars(doc) {
     // Drop bars left behind when the sidebar switched to another block.
     var old = doc.querySelectorAll('.tf-vars');
@@ -141,14 +202,15 @@
     var labels = doc.querySelectorAll('label.MuiInputLabel-root, label.MuiFormLabel-root');
     for (var i = 0; i < labels.length; i++) {
       var lb = labels[i];
-      if (!VAR_FIELDS[(lb.textContent || '').trim()]) continue;
+      var lt = (lb.textContent || '').trim(), isUrl = !!URL_FIELDS[lt];
+      if (!VAR_FIELDS[lt] && !isUrl) continue;
       var fc = lb.closest('.MuiFormControl-root, .MuiTextField-root');
       if (!fc || inCanvas(fc)) continue;
       var field = fc.querySelector('textarea:not([aria-hidden]), input[type="text"], input:not([type])');
       if (!field) continue;
       var prev = fc.previousElementSibling;
       if (prev && prev.classList && prev.classList.contains('tf-vars')) { prev.__field = field; continue; }
-      var bar = varBar(doc, field);
+      var bar = isUrl ? utmBar(doc, field) : varBar(doc, field);
       fc.parentNode.insertBefore(bar, fc);
     }
   }
@@ -161,7 +223,7 @@
       if (!n.nodeValue || !inCanvas(n)) continue;
       if (n.nodeValue.indexOf('{{') > -1 && VAR_RE.test(n.nodeValue)) {
         VAR_RE.lastIndex = 0;
-        n.nodeValue = n.nodeValue.replace(VAR_RE, function (m, k) { return '«' + VAR_LABEL[k] + '»'; });
+        n.nodeValue = n.nodeValue.replace(VAR_RE, function (m, k, def) { return '«' + VAR_LABEL[k] + (def ? ' / ' + def : '') + '»'; });
       }
       VAR_RE.lastIndex = 0;
       if (n.nodeValue.indexOf('«') > -1) list.push(n);
@@ -341,13 +403,16 @@
   XMLHttpRequest.prototype.send = function (d) {
     try {
       var i = this.__he;
-      if (i && /^(POST|PUT)$/i.test(i.m) && /\/api\/(templates|campaigns)(\/\d+)?$/.test(i.u.split('?')[0]) &&
+      if (i && /^(POST|PUT)$/i.test(i.m) && /\/api\/(templates|campaigns)(\/\d+)?(\/test)?$/.test(i.u.split('?')[0]) &&
           typeof d === 'string' && d.indexOf('"body"') > -1) {
-        var o = JSON.parse(d);
+        var o = JSON.parse(d), ch = false;
         if (o && typeof o.body === 'string' && (o.type === 'campaign_visual' || o.content_type === 'visual')) {
-          o.body = rtl(o.body);
-          d = JSON.stringify(o);
+          o.body = rtl(o.body); ch = true;
         }
+        if (o && /\/api\/campaigns/.test(i.u) && typeof o.body === 'string' && o.body.indexOf(UTM_MARK) > -1) {
+          o.body = fillUtm(o.body, o.name); ch = true;
+        }
+        if (ch) d = JSON.stringify(o);
       }
     } catch (e) { /* ignore */ }
     return oSend.call(this, d);
@@ -377,7 +442,7 @@
             fetch: function (cb) {
               cb(VARS.map(function (v) {
                 return { type: 'menuitem', text: v[0], onAction: function () {
-                  ed.insertContent('<span class="tf-var" data-label="' + v[0] + '" contenteditable="false">' + v[1] + '</span>&nbsp;');
+                  ed.insertContent('<span class="tf-var" data-label="' + v[0] + (varDefault ? ' / ' + varDefault : '') + '" contenteditable="false">' + varToken(v[1]) + '</span>&nbsp;');
                 } };
               }));
             }
