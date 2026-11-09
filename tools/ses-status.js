@@ -62,7 +62,7 @@ const sesAccount = () => call({
 });
 
 const planState = () => call({
-  method: 'POST', host: 'freetier.us-east-1.amazonaws.com', path: '/',
+  method: 'POST', host: 'freetier.us-east-1.api.aws', path: '/',
   region: 'us-east-1', service: 'freetier', body: '{}',
   headers: { 'content-type': 'application/x-amz-json-1.0', 'x-amz-target': 'AWSFreeTierService.GetAccountPlanState' },
 });
