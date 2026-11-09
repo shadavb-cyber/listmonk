@@ -187,41 +187,43 @@
     f.parentNode.insertBefore(bar, f.nextSibling);
   }
 
-  // Preview window: the demo subscriber is shown as a highlighted Hebrew sample.
-  var DEMO = [['Demo Subscriber', 'ישראל ישראלי'], ['demo@listmonk.app', 'israel@example.com'], ['Demo', 'ישראל'], ['Subscriber', 'ישראלי']];
-  function fixPreview(ifr) {
-    var doc; try { doc = ifr.contentDocument; } catch (e) { return; }
-    if (!doc || !doc.body || doc.body.__tfDemo) return;
-    doc.body.__tfDemo = true;
-    var tw = doc.createTreeWalker(doc.body, 4, null), n, nodes = [];
-    while ((n = tw.nextNode())) if (/Demo|Subscriber|demo@listmonk/.test(n.nodeValue)) nodes.push(n);
-    var re = /Demo Subscriber|demo@listmonk\.app|\bDemo\b|\bSubscriber\b/g;
-    nodes.forEach(function (t) {
-      var p = t.parentNode; if (!p || /^(SCRIPT|STYLE|TITLE)$/.test(p.nodeName)) return;
-      var frag = doc.createDocumentFragment(), s = t.nodeValue, last = 0, m;
-      re.lastIndex = 0;
-      while ((m = re.exec(s))) {
-        frag.appendChild(doc.createTextNode(s.slice(last, m.index)));
-        var sp = doc.createElement('span');
-        sp.style.cssText = 'background:#FFF1C1;border-radius:3px;padding:0 2px';
-        sp.title = 'דוגמה: כאן יופיעו פרטי הנמען';
-        DEMO.forEach(function (d) { if (d[0] === m[0]) sp.textContent = d[1]; });
-        frag.appendChild(sp); last = m.index + m[0].length;
-      }
-      frag.appendChild(doc.createTextNode(s.slice(last)));
-      p.replaceChild(frag, t);
+  // Preview window: the preview frame is sandboxed, so we load the preview ourselves and show
+  // the demo subscriber as a highlighted Hebrew sample.
+  var DEMO = { 'Demo Subscriber': 'ישראל ישראלי', 'demo@listmonk.app': 'israel@example.com', 'Demo': 'ישראל', 'Subscriber': 'ישראלי' };
+  function demoize(html) {
+    return html.replace(/>([^<]+)</g, function (m, t) {
+      return '>' + t.replace(/Demo Subscriber|demo@listmonk\.app|\bDemo\b|\bSubscriber\b/g, function (x) {
+        return '<span style="background:#FFF1C1;border-radius:3px;padding:0 2px" title="דוגמה: כאן יופיעו פרטי הנמען">' + DEMO[x] + '</span>';
+      }) + '<';
     });
   }
+  function setPreview(ifr, html) { ifr.srcdoc = demoize(html); }
+  var oSubmit = HTMLFormElement.prototype.submit;
+  HTMLFormElement.prototype.submit = function () {
+    var form = this, tgt = form.getAttribute('target');
+    var ifr = tgt && document.querySelector('iframe[name="' + tgt + '"]');
+    if (ifr && ifr.closest('.modal') && (form.method || '').toLowerCase() === 'post') {
+      try {
+        var fd = new URLSearchParams(new FormData(form));
+        fetch(form.action, { method: 'POST', body: fd, credentials: 'same-origin' })
+          .then(function (r) { return r.text(); })
+          .then(function (h) { setPreview(ifr, h); })
+          .catch(function () { ifr.removeAttribute('srcdoc'); oSubmit.call(form); });
+        return;
+      } catch (e) { /* fall through */ }
+    }
+    return oSubmit.call(form);
+  };
   function hookPreview() {
     var f = document.querySelectorAll('.modal iframe');
     for (var i = 0; i < f.length; i++) {
-      var ifr = f[i];
-      if (ifr.id === 'visual-editor') continue;
-      if (!ifr.__tfPrev) {
-        ifr.__tfPrev = true;
-        ifr.addEventListener('load', (function (x) { return function () { fixPreview(x); }; })(ifr));
-      }
-      fixPreview(ifr);
+      var ifr = f[i], src = ifr.getAttribute('src') || '';
+      if (ifr.id === 'visual-editor' || !src || src === 'about:blank' || ifr.__tfSrc === src) continue;
+      ifr.__tfSrc = src;
+      (function (x, u) {
+        fetch(u, { credentials: 'same-origin' }).then(function (r) { return r.text(); })
+          .then(function (h) { if (x.__tfSrc === u) setPreview(x, h); }).catch(function () { /* keep default */ });
+      })(ifr, src);
     }
   }
 
