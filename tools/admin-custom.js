@@ -183,7 +183,7 @@
     var f = inp.closest('.field');
     if (!f || (f.nextElementSibling && f.nextElementSibling.classList.contains('tf-vars'))) return;
     var bar = varBar(document, inp);
-    bar.style.marginTop = '-6px';
+    bar.style.margin = '-4px 0 16px';
     f.parentNode.insertBefore(bar, f.nextSibling);
   }
 
