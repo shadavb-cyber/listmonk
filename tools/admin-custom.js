@@ -978,6 +978,7 @@
         .then(function () { listsCache = null; return newId; });
     });
   }
+  window.__tfPrepareSend = prepareSend;
   function banner(text, bad) {
     var b = document.getElementById('tf-banner');
     if (!b) { b = el('div', { id: 'tf-banner' }); document.body.appendChild(b); }
