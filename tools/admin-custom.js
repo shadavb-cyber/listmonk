@@ -390,6 +390,7 @@
     try { sesCard(); } catch (e) { /* ignore */ }
     try { subjectVars(); } catch (e) { /* ignore */ }
     try { hookPreview(); } catch (e) { /* ignore */ }
+    try { filterUI(); } catch (e) { /* ignore */ }
     var f = document.querySelectorAll('iframe#visual-editor');
     for (var i = 0; i < f.length; i++) hook(f[i]);
   }
@@ -540,6 +541,421 @@
       if (b) b.innerHTML = sesHtml(d);
     });
   }
+
+  // ---- Subscriber filter builder (no SQL) + campaign list exclusion / recipient count ----
+  var SEG_CSS =
+    '#tf-filter,#tf-camp{direction:rtl;background:#FBF8F1;border:1px solid #E6E0D2;border-radius:8px;padding:12px 14px;margin:10px 0 14px;font-size:14px}' +
+    '#tf-filter h4,#tf-camp h4{font-weight:600;margin:0 0 8px;color:#13404B}' +
+    '.tf-row{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:6px}' +
+    '.tf-row select,.tf-row input,#tf-camp select{border:1px solid #d6d0c2;border-radius:6px;padding:4px 8px;font-size:13px;background:#fff;font-family:inherit;max-width:100%}' +
+    '.tf-row input{min-width:160px}' +
+    '.tf-x{border:0;background:none;color:#a33;cursor:pointer;font-size:16px;padding:0 6px}' +
+    '.tf-btns{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:8px}' +
+    '.tf-btn{border:1px solid #C9A043;background:#FBF4E2;color:#13404B;border-radius:6px;padding:4px 12px;cursor:pointer;font-family:inherit;font-size:13px}' +
+    '.tf-btn.pri{background:#13404B;border-color:#13404B;color:#fff}' +
+    '.tf-btn:disabled{opacity:.5;cursor:default}' +
+    '.tf-note{color:#777;font-size:12px}' +
+    '.tf-chip{display:inline-flex;align-items:center;gap:4px;background:#F3E3B5;color:#13404B;border-radius:999px;padding:2px 4px 2px 10px;margin:2px;font-size:13px}' +
+    '.tf-sum{width:100%;max-width:520px;margin-top:8px;border-collapse:collapse}' +
+    '.tf-sum td{padding:3px 6px;border-bottom:1px solid #eee5d3}.tf-sum td:last-child{text-align:left;font-weight:600}' +
+    '.tf-sum tr.tot td{border-top:2px solid #C9A043;font-size:15px;color:#13404B}' +
+    '#tf-filter pre{direction:ltr;text-align:left;white-space:pre-wrap;font-size:11px;background:#fff;padding:6px;margin-top:6px}';
+
+  function sq(v) { return "'" + String(v).replace(/'/g, "''") + "'"; }
+  function likeEsc(v) { return String(v).replace(/[\\%_]/g, '\\$&'); }
+  function apiJ(path, opt) {
+    opt = opt || {};
+    if (opt.body && typeof opt.body !== 'string') {
+      opt.headers = { 'Content-Type': 'application/json' };
+      opt.body = JSON.stringify(opt.body);
+    }
+    return fetch(path, opt).then(function (r) {
+      return r.json().then(function (j) {
+        if (!r.ok) throw new Error((j && j.message) || ('HTTP ' + r.status));
+        return j.data;
+      });
+    });
+  }
+  function countExp(exp) {
+    return apiJ('/api/subscribers?per_page=1&page=1&query=' + encodeURIComponent(exp)).then(function (d) { return d.total || 0; });
+  }
+  var listsCache = null, listsAt = 0;
+  function getLists(force) {
+    if (!force && listsCache && Date.now() - listsAt < 60000) return Promise.resolve(listsCache);
+    return apiJ('/api/lists?per_page=all').then(function (d) {
+      listsCache = (d.results || d || []).slice().sort(function (a, b) { return a.name.localeCompare(b.name, 'he'); });
+      listsAt = Date.now();
+      return listsCache;
+    });
+  }
+  var campsCache = null;
+  function getCamps() {
+    if (campsCache) return Promise.resolve(campsCache);
+    return apiJ('/api/campaigns?per_page=all&no_body=true').then(function (d) {
+      campsCache = (d.results || []).filter(function (c) { return c.status !== 'draft'; });
+      return campsCache;
+    });
+  }
+  function el(tag, attrs, kids) {
+    var e = document.createElement(tag);
+    if (attrs) Object.keys(attrs).forEach(function (k) {
+      if (k === 'text') e.textContent = attrs[k];
+      else if (k === 'on') Object.keys(attrs.on).forEach(function (ev) { e.addEventListener(ev, attrs.on[ev]); });
+      else e.setAttribute(k, attrs[k]);
+    });
+    (kids || []).forEach(function (c) { if (c) e.appendChild(c); });
+    return e;
+  }
+  function opts(sel, list, cur) {
+    sel.innerHTML = '';
+    list.forEach(function (o) {
+      var op = el('option', { value: o[0], text: o[1] });
+      if (String(o[0]) === String(cur)) op.selected = true;
+      sel.appendChild(op);
+    });
+  }
+
+  // Field definitions for the filter builder.
+  var TEXT_OPS = [['contains', 'מכיל'], ['not_contains', 'לא מכיל'], ['equals', 'שווה ל'], ['starts', 'מתחיל ב'], ['ends', 'מסתיים ב'], ['empty', 'ריק'], ['not_empty', 'לא ריק']];
+  var FIELDS = {
+    name: { label: 'שם', kind: 'text', col: 'subscribers.name' },
+    email: { label: 'אימייל', kind: 'text', col: 'subscribers.email' },
+    phone: { label: 'טלפון', kind: 'text', col: "subscribers.attribs->>'phone'" },
+    source: { label: 'מקור', kind: 'text', col: "subscribers.attribs->>'source'" },
+    attr: { label: 'שדה נוסף (לפי שם)', kind: 'attr' },
+    status: { label: 'סטטוס', kind: 'enum', ops: [['is', 'הוא'], ['not', 'אינו']], values: [['enabled', 'פעיל'], ['blocklisted', 'חסום']] },
+    list: { label: 'רשימה', kind: 'list', ops: [['in', 'רשום לרשימה'], ['not_in', 'לא רשום לרשימה'], ['unsub', 'הסיר את עצמו מהרשימה']] },
+    created: { label: 'תאריך הצטרפות', kind: 'date', ops: [['after', 'מתאריך'], ['before', 'עד תאריך']] },
+    opened: { label: 'פתיחת מייל', kind: 'camp', ops: [['yes', 'פתח'], ['no', 'לא פתח']] },
+    clicked: { label: 'לחיצה על קישור', kind: 'camp', ops: [['yes', 'לחץ'], ['no', 'לא לחץ']] },
+    bounced: { label: 'החזרות', kind: 'flag', ops: [['any', 'יש החזרות'], ['hard', 'יש החזרה קשה'], ['none', 'אין החזרות']] }
+  };
+
+  function textSql(col, op, v) {
+    var e = likeEsc(v);
+    switch (op) {
+      case 'contains': return col + ' ILIKE ' + sq('%' + e + '%');
+      case 'not_contains': return 'COALESCE(' + col + ", '') NOT ILIKE " + sq('%' + e + '%');
+      case 'equals': return 'LOWER(' + col + ') = LOWER(' + sq(v) + ')';
+      case 'starts': return col + ' ILIKE ' + sq(e + '%');
+      case 'ends': return col + ' ILIKE ' + sq('%' + e);
+      case 'empty': return 'COALESCE(' + col + ", '') = ''";
+      case 'not_empty': return 'COALESCE(' + col + ", '') <> ''";
+    }
+    return '';
+  }
+  function condSql(c) {
+    var f = FIELDS[c.field];
+    if (!f) return '';
+    var needV = !(c.op === 'empty' || c.op === 'not_empty');
+    if (f.kind === 'text') return (needV && !c.value) ? '' : textSql(f.col, c.op, c.value || '');
+    if (f.kind === 'attr') {
+      var key = String(c.key || '').replace(/[^\w֐-׿-]/g, '');
+      if (!key || (needV && !c.value)) return '';
+      return textSql('subscribers.attribs->>' + sq(key), c.op, c.value || '');
+    }
+    if (f.kind === 'enum') return 'subscribers.status ' + (c.op === 'not' ? '<>' : '=') + ' ' + sq(c.value || 'enabled');
+    if (f.kind === 'list') {
+      var id = parseInt(c.value, 10);
+      if (!id) return '';
+      if (c.op === 'unsub') return 'subscribers.id IN (SELECT subscriber_id FROM subscriber_lists WHERE list_id = ' + id + " AND status = 'unsubscribed')";
+      return 'subscribers.id ' + (c.op === 'not_in' ? 'NOT IN' : 'IN') +
+        ' (SELECT subscriber_id FROM subscriber_lists WHERE list_id = ' + id + " AND status <> 'unsubscribed')";
+    }
+    if (f.kind === 'date') {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(c.value || '')) return '';
+      return c.op === 'before' ? "subscribers.created_at < (DATE " + sq(c.value) + " + 1)" : "subscribers.created_at >= DATE " + sq(c.value);
+    }
+    if (f.kind === 'camp') {
+      var tbl = c.field === 'opened' ? 'campaign_views' : 'link_clicks';
+      var cid = parseInt(c.value, 10);
+      var where = 'subscriber_id IS NOT NULL' + (cid ? ' AND campaign_id = ' + cid : '');
+      return 'subscribers.id ' + (c.op === 'no' ? 'NOT IN' : 'IN') + ' (SELECT subscriber_id FROM ' + tbl + ' WHERE ' + where + ')';
+    }
+    if (f.kind === 'flag') {
+      if (c.op === 'none') return 'subscribers.id NOT IN (SELECT subscriber_id FROM bounces)';
+      return 'subscribers.id IN (SELECT subscriber_id FROM bounces' + (c.op === 'hard' ? " WHERE type = 'hard'" : '') + ')';
+    }
+    return '';
+  }
+
+  var filt = { rows: [{ field: 'name', op: 'contains', value: '' }], match: 'AND', showSql: false, active: false };
+  function filterSql() {
+    var parts = filt.rows.map(condSql).filter(Boolean);
+    if (!parts.length) return '';
+    return parts.length === 1 ? parts[0] : parts.map(function (p) { return '(' + p + ')'; }).join('\n' + filt.match + ' ');
+  }
+
+  function renderFilter(box) {
+    box.innerHTML = '';
+    box.appendChild(el('h4', { text: 'סינון מנויים' }));
+    var rowsWrap = el('div');
+    box.appendChild(rowsWrap);
+    filt.rows.forEach(function (c, i) {
+      var f = FIELDS[c.field];
+      var row = el('div', { class: 'tf-row' });
+      var fs = el('select');
+      opts(fs, Object.keys(FIELDS).map(function (k) { return [k, FIELDS[k].label]; }), c.field);
+      fs.addEventListener('change', function () {
+        var nf = FIELDS[fs.value];
+        filt.rows[i] = { field: fs.value, op: (nf.ops || TEXT_OPS)[0][0], value: '' };
+        renderFilter(box);
+      });
+      row.appendChild(fs);
+      if (f.kind === 'attr') {
+        var ki = el('input', { type: 'text', placeholder: 'שם השדה, למשל city' });
+        ki.value = c.key || '';
+        ki.addEventListener('input', function () { c.key = ki.value; });
+        row.appendChild(ki);
+      }
+      var os = el('select');
+      opts(os, f.ops || TEXT_OPS, c.op);
+      os.addEventListener('change', function () { c.op = os.value; renderFilter(box); });
+      row.appendChild(os);
+
+      if (f.kind === 'text' || f.kind === 'attr') {
+        if (c.op !== 'empty' && c.op !== 'not_empty') {
+          var vi = el('input', { type: 'text', placeholder: 'ערך' });
+          vi.value = c.value || '';
+          vi.addEventListener('input', function () { c.value = vi.value; });
+          vi.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); applyFilter(); } });
+          row.appendChild(vi);
+        }
+      } else if (f.kind === 'enum') {
+        var es = el('select');
+        if (!c.value) c.value = f.values[0][0];
+        opts(es, f.values, c.value);
+        es.addEventListener('change', function () { c.value = es.value; });
+        row.appendChild(es);
+      } else if (f.kind === 'date') {
+        var di = el('input', { type: 'date' });
+        di.value = c.value || '';
+        di.addEventListener('change', function () { c.value = di.value; });
+        row.appendChild(di);
+      } else if (f.kind === 'list' || f.kind === 'camp') {
+        var ls = el('select');
+        ls.appendChild(el('option', { value: '', text: 'טוען...' }));
+        row.appendChild(ls);
+        (f.kind === 'list' ? getLists() : getCamps()).then(function (items) {
+          var o = items.map(function (x) { return [x.id, x.name + (f.kind === 'list' && x.subscriber_count != null ? ' (' + x.subscriber_count + ')' : '')]; });
+          o.unshift(['', f.kind === 'list' ? 'בחר רשימה' : 'כל קמפיין']);
+          opts(ls, o, c.value || '');
+        });
+        ls.addEventListener('change', function () { c.value = ls.value; });
+      }
+      if (filt.rows.length > 1) {
+        row.appendChild(el('button', { class: 'tf-x', type: 'button', title: 'הסרת תנאי', text: '×', on: { click: function () { filt.rows.splice(i, 1); renderFilter(box); } } }));
+      }
+      rowsWrap.appendChild(row);
+    });
+
+    var btns = el('div', { class: 'tf-btns' });
+    btns.appendChild(el('button', { class: 'tf-btn', type: 'button', text: '+ הוספת תנאי', on: { click: function () { filt.rows.push({ field: 'name', op: 'contains', value: '' }); renderFilter(box); } } }));
+    var ms = el('select');
+    opts(ms, [['AND', 'כל התנאים מתקיימים'], ['OR', 'לפחות תנאי אחד מתקיים']], filt.match);
+    ms.addEventListener('change', function () { filt.match = ms.value; });
+    if (filt.rows.length > 1) btns.appendChild(ms);
+    btns.appendChild(el('button', { class: 'tf-btn pri', type: 'button', text: 'סינון', on: { click: applyFilter } }));
+    btns.appendChild(el('button', { class: 'tf-btn', type: 'button', text: 'ניקוי', on: { click: clearFilter } }));
+    btns.appendChild(el('a', { href: '#', class: 'tf-note', text: filt.showSql ? 'הסתרת השאילתה' : 'הצגת השאילתה',
+      on: { click: function (e) { e.preventDefault(); filt.showSql = !filt.showSql; renderFilter(box); } } }));
+    box.appendChild(btns);
+    var msg = el('div', { class: 'tf-note', id: 'tf-filter-msg' });
+    if (filt.active) msg.textContent = 'הסינון פעיל. המספר בכותרת הוא מספר המנויים שעונים לתנאים. אפשר לסמן את כולם ולבצע פעולה (הוספה לרשימה, חסימה וכו\').';
+    box.appendChild(msg);
+    if (filt.showSql) box.appendChild(el('pre', { text: filterSql() || '(אין תנאים)' }));
+  }
+
+  function subsVm() {
+    var s = document.querySelector('section.subscribers');
+    return s && s.__vue__;
+  }
+  function applyFilter() {
+    var vm = subsVm(), exp = filterSql();
+    var m = document.getElementById('tf-filter-msg');
+    if (!vm) return;
+    if (!exp) { if (m) m.textContent = 'חסר ערך באחד התנאים.'; return; }
+    filt.active = true;
+    vm.queryInput = '';
+    vm.queryParams.search = '';
+    vm.queryParams.queryExp = exp;
+    vm.querySubscribers({ page: 1 });
+    renderFilter(document.getElementById('tf-filter'));
+  }
+  function clearFilter() {
+    var vm = subsVm();
+    filt = { rows: [{ field: 'name', op: 'contains', value: '' }], match: 'AND', showSql: false, active: false };
+    if (vm) {
+      vm.isSearchAdvanced = false;
+      vm.queryParams.queryExp = '';
+      vm.querySubscribers({ page: 1 });
+    }
+    renderFilter(document.getElementById('tf-filter'));
+  }
+  function filterUI() {
+    var sec = document.querySelector('section.subscribers');
+    if (!sec) return;
+    if (document.getElementById('tf-filter')) return;
+    var ctl = sec.querySelector('.subscribers-controls');
+    if (!ctl) return;
+    var box = el('div', { id: 'tf-filter' });
+    ctl.parentNode.insertBefore(box, ctl.nextSibling);
+    renderFilter(box);
+  }
+
+  // ---- Campaign: exclude lists, unique recipient count, build a filtered send list ----
+  var camp = { key: '', excl: [], last: '', busy: false, confirm: false, msg: '' };
+  function campVm() {
+    var s = document.querySelector('section.campaign');
+    return s && s.__vue__;
+  }
+  function eligExp(ids) {
+    return "subscribers.status <> 'blocklisted' AND subscribers.id IN (SELECT sl.subscriber_id FROM subscriber_lists sl " +
+      'JOIN lists l ON l.id = sl.list_id WHERE sl.list_id IN (' + ids.join(',') + ") AND sl.status <> 'unsubscribed' " +
+      "AND (l.optin <> 'double' OR sl.status = 'confirmed'))";
+  }
+  function exclExp(ids) {
+    return 'subscribers.id NOT IN (SELECT subscriber_id FROM subscriber_lists WHERE list_id IN (' + ids.join(',') + '))';
+  }
+  function finalExp(inc, exc) {
+    var e = eligExp(inc);
+    return exc.length ? e + ' AND ' + exclExp(exc) : e;
+  }
+  function nf2(n) { return Number(n || 0).toLocaleString('he-IL'); }
+
+  function renderCamp(box, vm) {
+    var inc = (vm.form.lists || []).map(function (l) { return l.id; });
+    box.innerHTML = '';
+    box.appendChild(el('h4', { text: 'נמענים והחרגות' }));
+
+    // Exclusion picker.
+    var row = el('div', { class: 'tf-row' });
+    row.appendChild(el('span', { text: 'החרגת רשימות (מי שנמצא בהן לא יקבל):' }));
+    camp.excl.forEach(function (l) {
+      row.appendChild(el('span', { class: 'tf-chip' }, [document.createTextNode(l.name),
+        el('button', { class: 'tf-x', type: 'button', text: '×', on: { click: function () {
+          camp.excl = camp.excl.filter(function (x) { return x.id !== l.id; }); camp.last = ''; renderCamp(box, vm); } } })]));
+    });
+    var sel = el('select');
+    sel.appendChild(el('option', { value: '', text: '+ הוספת רשימה להחרגה' }));
+    row.appendChild(sel);
+    getLists().then(function (ls) {
+      ls.forEach(function (l) {
+        if (inc.indexOf(l.id) > -1 || camp.excl.some(function (x) { return x.id === l.id; })) return;
+        sel.appendChild(el('option', { value: l.id, text: l.name + ' (' + nf2(l.subscriber_count) + ')' }));
+      });
+    });
+    sel.addEventListener('change', function () {
+      var id = parseInt(sel.value, 10);
+      var l = (listsCache || []).filter(function (x) { return x.id === id; })[0];
+      if (l) { camp.excl.push({ id: l.id, name: l.name }); camp.last = ''; renderCamp(box, vm); }
+    });
+    box.appendChild(row);
+
+    var sum = el('div', { id: 'tf-camp-sum', class: 'tf-note', text: inc.length ? 'מחשב...' : 'בחר רשימות כדי לראות את מספר הנמענים.' });
+    box.appendChild(sum);
+    var act = el('div', { class: 'tf-btns' });
+    box.appendChild(act);
+    if (camp.msg) box.appendChild(el('div', { class: 'tf-note', text: camp.msg }));
+    if (!inc.length) return;
+
+    var key = inc.join(',') + '|' + camp.excl.map(function (x) { return x.id; }).join(',');
+    var run = key;
+    camp.last = key;
+    var exc = camp.excl.map(function (x) { return x.id; });
+    Promise.all([
+      Promise.all(inc.map(function (id) { return countExp(eligExp([id])); })),
+      countExp(eligExp(inc)),
+      exc.length ? countExp(finalExp(inc, exc)) : null
+    ]).then(function (r) {
+      if (camp.last !== run) return;
+      var per = r[0], total = per.reduce(function (a, b) { return a + b; }, 0), uniq = r[1];
+      var fin = exc.length ? r[2] : uniq;
+      var t = el('table', { class: 'tf-sum' });
+      var add = function (a, b, cls) { t.appendChild(el('tr', cls ? { class: cls } : null, [el('td', { text: a }), el('td', { text: b })])); };
+      (vm.form.lists || []).forEach(function (l, i) { add('ברשימה "' + l.name + '"', nf2(per[i])); });
+      if (inc.length > 1) add('פחות מי שנמצא ביותר מרשימה אחת (מקבל פעם אחת)', '-' + nf2(total - uniq));
+      if (exc.length) add('פחות מי שנמצא ברשימות ההחרגה', '-' + nf2(uniq - fin));
+      add('סה"כ יקבלו את הקמפיין', nf2(fin), 'tot');
+      sum.innerHTML = '';
+      sum.appendChild(t);
+      sum.appendChild(el('div', { class: 'tf-note', text: 'לא כולל מנויים חסומים ומי שהסיר את עצמו מהרשימה.' }));
+      if (exc.length) {
+        sum.appendChild(el('div', { class: 'tf-note', text: 'listmonk לא יודע להחריג רשימות בזמן השליחה, לכן צריך ליצור רשימת שליחה מסוננת ולשלוח אליה.' }));
+        var b = el('button', { class: 'tf-btn pri', type: 'button',
+          text: camp.confirm ? 'לאשר? תיווצר רשימה חדשה עם ' + nf2(fin) + ' נמענים' : 'יצירת רשימת שליחה מסוננת ובחירתה לקמפיין' });
+        b.disabled = camp.busy || !vm.canEdit;
+        b.addEventListener('click', function () {
+          if (!camp.confirm) { camp.confirm = true; renderCamp(box, vm); return; }
+          buildSendList(box, vm, inc, exc, fin);
+        });
+        act.appendChild(b);
+        if (camp.confirm) act.appendChild(el('button', { class: 'tf-btn', type: 'button', text: 'ביטול', on: { click: function () { camp.confirm = false; renderCamp(box, vm); } } }));
+      }
+    }).catch(function (e) {
+      if (camp.last === run) sum.textContent = 'שגיאה בחישוב: ' + e.message;
+    });
+  }
+
+  function buildSendList(box, vm, inc, exc, expected) {
+    camp.busy = true; camp.confirm = false;
+    camp.msg = 'יוצר רשימה...';
+    renderCamp(box, vm);
+    var d = new Date();
+    var name = 'שליחה: ' + (vm.form.name || 'קמפיין') + ' (' + d.toLocaleDateString('he-IL') + ')';
+    var exNames = camp.excl.map(function (x) { return x.name; }).join(', ');
+    var incNames = (vm.form.lists || []).map(function (x) { return x.name; }).join(', ');
+    var newId;
+    apiJ('/api/lists', { method: 'POST', body: { name: name, type: 'private', optin: 'single', status: 'active', tags: ['רשימת-שליחה'],
+      description: 'נוצרה אוטומטית: ' + incNames + ' פחות ' + exNames } })
+      .then(function (l) {
+        newId = l.id;
+        return apiJ('/api/subscribers/query/lists', { method: 'PUT', body: { query: finalExp(inc, exc), action: 'add', target_list_ids: [newId], status: 'confirmed' } });
+      })
+      .then(function () { return getLists(true); })
+      .then(function () { return vm.$api.getLists({ minimal: true, per_page: 'all' }); })
+      .then(function () {
+        var all = (vm.lists && vm.lists.results) || [];
+        var l = all.filter(function (x) { return x.id === newId; })[0] || { id: newId, name: name };
+        vm.form.lists = [l];
+        camp.excl = [];
+        camp.busy = false;
+        camp.msg = 'נוצרה הרשימה "' + name + '" ונבחרה לקמפיין במקום הרשימות הקודמות. זכור לשמור את הקמפיין.';
+        camp.last = '';
+        renderCamp(box, vm);
+      })
+      .catch(function (e) {
+        camp.busy = false;
+        camp.msg = 'שגיאה ביצירת הרשימה: ' + e.message + (newId ? ' (הרשימה נוצרה חלקית, מספר ' + newId + ')' : '');
+        renderCamp(box, vm);
+      });
+  }
+
+  function campUI() {
+    var sec = document.querySelector('section.campaign');
+    var box = document.getElementById('tf-camp');
+    if (!sec) { camp.key = ''; return; }
+    var vm = campVm();
+    if (!vm || !vm.form) return;
+    var ls = sec.querySelector('.list-selector');
+    if (!ls) return;
+    var pageKey = location.pathname;
+    if (camp.key !== pageKey) { camp = { key: pageKey, excl: [], last: '', busy: false, confirm: false, msg: '' }; if (box) box.remove(); box = null; }
+    if (!box || !box.isConnected) {
+      box = el('div', { id: 'tf-camp' });
+      ls.parentNode.insertBefore(box, ls.nextSibling);
+      box.__inc = null;
+    }
+    var inc = (vm.form.lists || []).map(function (l) { return l.id; }).join(',');
+    if (box.__inc !== inc) { box.__inc = inc; renderCamp(box, vm); }
+  }
+
+  (function () {
+    var st = document.createElement('style');
+    st.textContent = SEG_CSS;
+    (document.head || document.documentElement).appendChild(st);
+  })();
+  setInterval(function () { try { campUI(); } catch (e) { /* ignore */ } }, 800);
 
   (function () {
     var st = document.createElement('style');
