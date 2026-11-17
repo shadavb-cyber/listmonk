@@ -403,6 +403,21 @@
   };
   XMLHttpRequest.prototype.send = function (d) {
     try {
+      var si = this.__he, sm = si && /^PUT$/i.test(si.m) && si.u.split('?')[0].match(/\/api\/campaigns\/(\d+)\/status$/);
+      var so = sm && typeof d === 'string' ? JSON.parse(d) : null;
+      if (so && (so.status === 'running' || so.status === 'scheduled')) {
+        var xhr = this;
+        prepareSend(sm[1]).then(function (nid) {
+          if (nid) banner('נוצרה רשימת שליחה מסוננת (בלי רשימות ההחרגה) והקמפיין יישלח אליה.');
+          oSend.call(xhr, d);
+        }).catch(function (e) {
+          banner('הקמפיין לא הופעל: ' + (e && e.message ? e.message : e), true);
+          try { xhr.abort(); } catch (e2) { /* ignore */ }
+        });
+        return;
+      }
+    } catch (e) { /* ignore */ }
+    try {
       var i = this.__he;
       if (i && /^(POST|PUT)$/i.test(i.m) && /\/api\/(templates|campaigns)(\/\d+)?(\/test)?$/.test(i.u.split('?')[0]) &&
           typeof d === 'string' && d.indexOf('"body"') > -1) {
@@ -559,6 +574,12 @@
     '.tf-sum{width:100%;max-width:520px;margin-top:8px;border-collapse:collapse}' +
     '.tf-sum td{padding:3px 6px;border-bottom:1px solid #eee5d3}.tf-sum td:last-child{text-align:left;font-weight:600}' +
     '.tf-sum tr.tot td{border-top:2px solid #C9A043;font-size:15px;color:#13404B}' +
+    'section.campaign.tf-has-lists .list-selector{display:none}' +
+    '.tf-lists{width:100%;border-collapse:collapse;background:#fff;margin-bottom:8px}' +
+    '.tf-lists th{font-weight:600;color:#13404B;text-align:right;padding:6px 8px;border-bottom:2px solid #E6E0D2;background:#F7F3EA}' +
+    '.tf-lists td{padding:5px 8px;border-bottom:1px solid #f0ebe0}.tf-lists td:nth-child(n+2),.tf-lists th:nth-child(n+2){text-align:center;width:90px}' +
+    '.tf-lists tr.inc td{background:#eef7ee}.tf-lists tr.exc td{background:#fdecea}' +
+    '.tf-lists input[type=checkbox]{width:18px;height:18px;cursor:pointer}' +
     '#tf-filter pre{direction:ltr;text-align:left;white-space:pre-wrap;font-size:11px;background:#fff;padding:6px;margin-top:6px}';
 
   function sq(v) { return "'" + String(v).replace(/'/g, "''") + "'"; }
@@ -803,8 +824,11 @@
     renderFilter(box);
   }
 
-  // ---- Campaign: exclude lists, unique recipient count, build a filtered send list ----
-  var camp = { key: '', excl: [], last: '', busy: false, confirm: false, msg: '' };
+  // ---- Campaign: tick lists to send to / exclude, live unique count, automatic filtered send list ----
+  // Exclusions are stored in the campaign's attribs (tf_exclude). listmonk cannot exclude lists while
+  // sending, so when the campaign is started or scheduled we build a "send list" (included lists minus
+  // excluded lists) and point the campaign at it, just before the status change goes through.
+  var camp = { key: '', run: '' };
   function campVm() {
     var s = document.querySelector('section.campaign');
     return s && s.__vue__;
@@ -814,121 +838,97 @@
       'JOIN lists l ON l.id = sl.list_id WHERE sl.list_id IN (' + ids.join(',') + ") AND sl.status <> 'unsubscribed' " +
       "AND (l.optin <> 'double' OR sl.status = 'confirmed'))";
   }
-  function exclExp(ids) {
-    return 'subscribers.id NOT IN (SELECT subscriber_id FROM subscriber_lists WHERE list_id IN (' + ids.join(',') + '))';
-  }
   function finalExp(inc, exc) {
     var e = eligExp(inc);
-    return exc.length ? e + ' AND ' + exclExp(exc) : e;
+    return exc.length ? e + ' AND subscribers.id NOT IN (SELECT subscriber_id FROM subscriber_lists WHERE list_id IN (' + exc.join(',') + '))' : e;
   }
   function nf2(n) { return Number(n || 0).toLocaleString('he-IL'); }
+  function campAttribs(vm) {
+    try { return JSON.parse(vm.form.attribsStr || '{}') || {}; } catch (e) { return vm.form.attribs || {}; }
+  }
+  function setExclude(vm, ids) {
+    var a = campAttribs(vm);
+    if (ids.length) a.tf_exclude = ids; else delete a.tf_exclude;
+    vm.form.attribsStr = JSON.stringify(a, null, 4);
+    vm.form.attribs = a;
+  }
+  function getExclude(vm) {
+    var x = campAttribs(vm).tf_exclude;
+    return Array.isArray(x) ? x.map(Number) : [];
+  }
+  function getInclude(vm) {
+    var a = campAttribs(vm);
+    // After the start, the campaign points at the generated send list; show what was originally ticked.
+    if (!vm.canEdit && Array.isArray(a.tf_include)) return a.tf_include.map(Number);
+    return (vm.form.lists || []).map(function (l) { return l.id; });
+  }
 
   function renderCamp(box, vm) {
-    var inc = (vm.form.lists || []).map(function (l) { return l.id; });
+    var inc = getInclude(vm), exc = getExclude(vm), ro = !vm.canEdit;
     box.innerHTML = '';
-    box.appendChild(el('h4', { text: 'נמענים והחרגות' }));
+    box.appendChild(el('h4', { text: 'רשימות לשליחה' }));
+    var tbl = el('table', { class: 'tf-lists' });
+    tbl.appendChild(el('tr', null, [el('th', { text: 'רשימה' }), el('th', { text: 'אנשי קשר' }), el('th', { text: 'לשלוח' }), el('th', { text: 'להחריג' })]));
+    box.appendChild(tbl);
+    var sum = el('div', { class: 'tf-camp-sum' });
+    box.appendChild(sum);
 
-    // Exclusion picker.
-    var row = el('div', { class: 'tf-row' });
-    row.appendChild(el('span', { text: 'החרגת רשימות (מי שנמצא בהן לא יקבל):' }));
-    camp.excl.forEach(function (l) {
-      row.appendChild(el('span', { class: 'tf-chip' }, [document.createTextNode(l.name),
-        el('button', { class: 'tf-x', type: 'button', text: '×', on: { click: function () {
-          camp.excl = camp.excl.filter(function (x) { return x.id !== l.id; }); camp.last = ''; renderCamp(box, vm); } } })]));
-    });
-    var sel = el('select');
-    sel.appendChild(el('option', { value: '', text: '+ הוספת רשימה להחרגה' }));
-    row.appendChild(sel);
     getLists().then(function (ls) {
       ls.forEach(function (l) {
-        if (inc.indexOf(l.id) > -1 || camp.excl.some(function (x) { return x.id === l.id; })) return;
-        sel.appendChild(el('option', { value: l.id, text: l.name + ' (' + nf2(l.subscriber_count) + ')' }));
+        if (/^שליחה מסוננת:/.test(l.name) && inc.indexOf(l.id) < 0) return;
+        var ci = el('input', { type: 'checkbox' }), ce = el('input', { type: 'checkbox' });
+        ci.checked = inc.indexOf(l.id) > -1;
+        ce.checked = exc.indexOf(l.id) > -1;
+        ci.disabled = ce.disabled = ro;
+        ci.addEventListener('change', function () {
+          var all = (vm.lists && vm.lists.results) || [];
+          var ids = (vm.form.lists || []).map(function (x) { return x.id; }).filter(function (id) { return id !== l.id; });
+          if (ci.checked) ids.push(l.id);
+          vm.form.lists = all.filter(function (x) { return ids.indexOf(x.id) > -1; });
+          if (ci.checked && ce.checked) { setExclude(vm, getExclude(vm).filter(function (id) { return id !== l.id; })); }
+          renderCamp(box, vm);
+        });
+        ce.addEventListener('change', function () {
+          var ids = getExclude(vm).filter(function (id) { return id !== l.id; });
+          if (ce.checked) {
+            ids.push(l.id);
+            vm.form.lists = (vm.form.lists || []).filter(function (x) { return x.id !== l.id; });
+          }
+          setExclude(vm, ids);
+          renderCamp(box, vm);
+        });
+        var tr = el('tr', { class: ci.checked ? 'inc' : (ce.checked ? 'exc' : '') }, [
+          el('td', { text: l.name }), el('td', { text: nf2(l.subscriber_count) }),
+          el('td', null, [ci]), el('td', null, [ce])]);
+        tbl.appendChild(tr);
       });
     });
-    sel.addEventListener('change', function () {
-      var id = parseInt(sel.value, 10);
-      var l = (listsCache || []).filter(function (x) { return x.id === id; })[0];
-      if (l) { camp.excl.push({ id: l.id, name: l.name }); camp.last = ''; renderCamp(box, vm); }
-    });
-    box.appendChild(row);
 
-    var sum = el('div', { id: 'tf-camp-sum', class: 'tf-note', text: inc.length ? 'מחשב...' : 'בחר רשימות כדי לראות את מספר הנמענים.' });
-    box.appendChild(sum);
-    var act = el('div', { class: 'tf-btns' });
-    box.appendChild(act);
-    if (camp.msg) box.appendChild(el('div', { class: 'tf-note', text: camp.msg }));
-    if (!inc.length) return;
-
-    var key = inc.join(',') + '|' + camp.excl.map(function (x) { return x.id; }).join(',');
-    var run = key;
-    camp.last = key;
-    var exc = camp.excl.map(function (x) { return x.id; });
+    if (!inc.length) { sum.appendChild(el('div', { class: 'tf-note', text: 'סמן לפחות רשימה אחת לשליחה.' })); return; }
+    sum.appendChild(el('div', { class: 'tf-note', text: 'מחשב נמענים...' }));
+    var run = inc.join(',') + '|' + exc.join(',');
+    camp.run = run;
     Promise.all([
       Promise.all(inc.map(function (id) { return countExp(eligExp([id])); })),
       countExp(eligExp(inc)),
       exc.length ? countExp(finalExp(inc, exc)) : null
     ]).then(function (r) {
-      if (camp.last !== run) return;
+      if (camp.run !== run) return;
       var per = r[0], total = per.reduce(function (a, b) { return a + b; }, 0), uniq = r[1];
       var fin = exc.length ? r[2] : uniq;
       var t = el('table', { class: 'tf-sum' });
       var add = function (a, b, cls) { t.appendChild(el('tr', cls ? { class: cls } : null, [el('td', { text: a }), el('td', { text: b })])); };
-      (vm.form.lists || []).forEach(function (l, i) { add('ברשימה "' + l.name + '"', nf2(per[i])); });
+      add('סכום הרשימות שסומנו', nf2(total));
       if (inc.length > 1) add('פחות מי שנמצא ביותר מרשימה אחת (מקבל פעם אחת)', '-' + nf2(total - uniq));
       if (exc.length) add('פחות מי שנמצא ברשימות ההחרגה', '-' + nf2(uniq - fin));
       add('סה"כ יקבלו את הקמפיין', nf2(fin), 'tot');
       sum.innerHTML = '';
       sum.appendChild(t);
-      sum.appendChild(el('div', { class: 'tf-note', text: 'לא כולל מנויים חסומים ומי שהסיר את עצמו מהרשימה.' }));
-      if (exc.length) {
-        sum.appendChild(el('div', { class: 'tf-note', text: 'listmonk לא יודע להחריג רשימות בזמן השליחה, לכן צריך ליצור רשימת שליחה מסוננת ולשלוח אליה.' }));
-        var b = el('button', { class: 'tf-btn pri', type: 'button',
-          text: camp.confirm ? 'לאשר? תיווצר רשימה חדשה עם ' + nf2(fin) + ' נמענים' : 'יצירת רשימת שליחה מסוננת ובחירתה לקמפיין' });
-        b.disabled = camp.busy || !vm.canEdit;
-        b.addEventListener('click', function () {
-          if (!camp.confirm) { camp.confirm = true; renderCamp(box, vm); return; }
-          buildSendList(box, vm, inc, exc, fin);
-        });
-        act.appendChild(b);
-        if (camp.confirm) act.appendChild(el('button', { class: 'tf-btn', type: 'button', text: 'ביטול', on: { click: function () { camp.confirm = false; renderCamp(box, vm); } } }));
-      }
+      sum.appendChild(el('div', { class: 'tf-note', text: 'לא כולל מנויים חסומים ומי שהסיר את עצמו מהרשימה.' +
+        (exc.length && !ro ? ' ההחרגה תתבצע אוטומטית ברגע ההפעלה או התזמון של הקמפיין. אל תשכח לשמור.' : '') }));
     }).catch(function (e) {
-      if (camp.last === run) sum.textContent = 'שגיאה בחישוב: ' + e.message;
+      if (camp.run === run) { sum.innerHTML = ''; sum.appendChild(el('div', { class: 'tf-note', text: 'שגיאה בחישוב: ' + e.message })); }
     });
-  }
-
-  function buildSendList(box, vm, inc, exc, expected) {
-    camp.busy = true; camp.confirm = false;
-    camp.msg = 'יוצר רשימה...';
-    renderCamp(box, vm);
-    var d = new Date();
-    var name = 'שליחה: ' + (vm.form.name || 'קמפיין') + ' (' + d.toLocaleDateString('he-IL') + ')';
-    var exNames = camp.excl.map(function (x) { return x.name; }).join(', ');
-    var incNames = (vm.form.lists || []).map(function (x) { return x.name; }).join(', ');
-    var newId;
-    apiJ('/api/lists', { method: 'POST', body: { name: name, type: 'private', optin: 'single', status: 'active', tags: ['רשימת-שליחה'],
-      description: 'נוצרה אוטומטית: ' + incNames + ' פחות ' + exNames } })
-      .then(function (l) {
-        newId = l.id;
-        return apiJ('/api/subscribers/query/lists', { method: 'PUT', body: { query: finalExp(inc, exc), action: 'add', target_list_ids: [newId], status: 'confirmed' } });
-      })
-      .then(function () { return getLists(true); })
-      .then(function () { return vm.$api.getLists({ minimal: true, per_page: 'all' }); })
-      .then(function () {
-        var all = (vm.lists && vm.lists.results) || [];
-        var l = all.filter(function (x) { return x.id === newId; })[0] || { id: newId, name: name };
-        vm.form.lists = [l];
-        camp.excl = [];
-        camp.busy = false;
-        camp.msg = 'נוצרה הרשימה "' + name + '" ונבחרה לקמפיין במקום הרשימות הקודמות. זכור לשמור את הקמפיין.';
-        camp.last = '';
-        renderCamp(box, vm);
-      })
-      .catch(function (e) {
-        camp.busy = false;
-        camp.msg = 'שגיאה ביצירת הרשימה: ' + e.message + (newId ? ' (הרשימה נוצרה חלקית, מספר ' + newId + ')' : '');
-        renderCamp(box, vm);
-      });
   }
 
   function campUI() {
@@ -936,18 +936,56 @@
     var box = document.getElementById('tf-camp');
     if (!sec) { camp.key = ''; return; }
     var vm = campVm();
-    if (!vm || !vm.form) return;
+    if (!vm || !vm.form || !vm.lists || !vm.lists.results) return;
     var ls = sec.querySelector('.list-selector');
     if (!ls) return;
-    var pageKey = location.pathname;
-    if (camp.key !== pageKey) { camp = { key: pageKey, excl: [], last: '', busy: false, confirm: false, msg: '' }; if (box) box.remove(); box = null; }
+    sec.classList.add('tf-has-lists');
+    if (camp.key !== location.pathname) { camp.key = location.pathname; if (box) box.remove(); box = null; }
     if (!box || !box.isConnected) {
       box = el('div', { id: 'tf-camp' });
       ls.parentNode.insertBefore(box, ls.nextSibling);
-      box.__inc = null;
+      box.__sig = null;
     }
-    var inc = (vm.form.lists || []).map(function (l) { return l.id; }).join(',');
-    if (box.__inc !== inc) { box.__inc = inc; renderCamp(box, vm); }
+    var sig = getInclude(vm).join(',') + '|' + getExclude(vm).join(',') + '|' + vm.canEdit;
+    if (box.__sig !== sig) { box.__sig = sig; renderCamp(box, vm); }
+  }
+
+  // Before a draft campaign is started or scheduled: build the filtered send list if it has exclusions.
+  function prepareSend(id) {
+    return apiJ('/api/campaigns/' + id).then(function (c) {
+      var a = c.attribs || {};
+      var exc = Array.isArray(a.tf_exclude) ? a.tf_exclude.map(Number) : [];
+      if (!exc.length || c.status !== 'draft') return null;
+      var inc = (c.lists || []).map(function (l) { return l.id; });
+      if (!inc.length) throw new Error('לא נבחרו רשימות לשליחה');
+      var name = 'שליחה מסוננת: ' + c.name + ' (' + new Date().toLocaleDateString('he-IL') + ')';
+      var newId;
+      return apiJ('/api/lists', { method: 'POST', body: { name: name, type: 'private', optin: 'single', status: 'active', tags: ['רשימת-שליחה'],
+        description: 'נוצרה אוטומטית בהפעלת הקמפיין "' + c.name + '": רשימות ' + inc.join(',') + ' בלי ' + exc.join(',') } })
+        .then(function (l) {
+          newId = l.id;
+          return apiJ('/api/subscribers/query/lists', { method: 'PUT', body: { query: finalExp(inc, exc), action: 'add', target_list_ids: [newId], status: 'confirmed' } });
+        })
+        .then(function () {
+          var na = Object.assign({}, a, { tf_include: inc, tf_send_list: newId });
+          return apiJ('/api/campaigns/' + id, { method: 'PUT', body: {
+            name: c.name, subject: c.subject, lists: [newId], from_email: c.from_email, messenger: c.messenger, type: c.type || 'regular',
+            tags: c.tags || [], send_at: c.send_at || null, headers: c.headers || [], attribs: na, template_id: c.template_id,
+            content_type: c.content_type, body: c.body, body_source: c.body_source, altbody: c.altbody,
+            archive: c.archive, archive_template_id: c.archive_template_id, archive_meta: c.archive_meta, archive_slug: c.archive_slug,
+            media: (c.media || []).map(function (m) { return m.id; }) } });
+        })
+        .then(function () { listsCache = null; return newId; });
+    });
+  }
+  function banner(text, bad) {
+    var b = document.getElementById('tf-banner');
+    if (!b) { b = el('div', { id: 'tf-banner' }); document.body.appendChild(b); }
+    b.style.cssText = 'position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:9999;direction:rtl;padding:10px 16px;border-radius:8px;font-size:14px;box-shadow:0 2px 8px rgba(0,0,0,.2);' +
+      (bad ? 'background:#fdecea;color:#8a1c1c;border:1px solid #e0a3a3' : 'background:#eef7ee;color:#1d5a1d;border:1px solid #a9d3a9');
+    b.textContent = text;
+    clearTimeout(b.__t);
+    b.__t = setTimeout(function () { b.remove(); }, bad ? 15000 : 6000);
   }
 
   (function () {
